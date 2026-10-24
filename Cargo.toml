@@ -3,7 +3,16 @@ name = "anole"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+resolver = "3"
+members = [
+    "examples/tintilo",
+]
+
 [dependencies]
 
-[lints.clippy]
+[workspace.lints.clippy]
 mod_module_files = "deny"
+
+[lints]
+workspace = true
