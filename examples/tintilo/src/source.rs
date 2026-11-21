@@ -273,8 +273,6 @@ pub struct SourceManager {
 
     /// The mapping from `FileEntryRef` to `ContentId`, which is used to retrieve the corresponding `ContentCache` from the `contents` vector.
     file_infos: HashMap<FileEntryRef, ContentId>,
-    /// The list of content caches for memory buffers, which are not associated with any file.
-    mem_buf_infos: Vec<ContentId>,
 
     /// The list of source location entries, which are used to map from `SourceLocation` to the corresponding file or macro expansion.
     sloc_entries: Vec<SLocEntry>,
@@ -289,7 +287,6 @@ impl SourceManager {
             file_manager: FileManager::new(),
             contents: Vec::new(),
             file_infos: HashMap::new(),
-            mem_buf_infos: Vec::new(),
             sloc_entries: vec![
                 // dummy entry for invalid SourceLocation
                 SLocEntry {
@@ -322,7 +319,6 @@ impl SourceManager {
         let content_cache = ContentCache::new(None);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
-        self.mem_buf_infos.push(content_id);
         self.contents.last_mut().unwrap().set_buf(buf);
 
         content_id
