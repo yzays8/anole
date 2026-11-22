@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -14,35 +14,32 @@ use anyhow::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEntryId(usize);
 
-#[derive(Debug)]
-pub struct FileEntry {
-    pub file_path: PathBuf,
-}
-
 /// A reference to a file entry that can be used to retrieve the file entry from the `FileManager`.
 /// Using this ref with a different FileManager is a logic error.
-/// The equality and hash of a `FileEntryRef` are based on the `FileEntry` which it refers to.
 #[derive(Debug, Clone)]
 pub struct FileEntryRef {
-    /// The ID of the `FileManager` that owns the referenced `FileEntry`.
+    /// The ID of the `FileManager` that owns the referenced `FileEntryId`.
     manager_id: FileManagerId,
-    /// The path as requested (e.g. as written in `#include`). May differ from `FileEntry::file_path` when one file is reached via different paths.
+    /// The path as requested (e.g. as written in `#include`).
     include_path: PathBuf,
     file_entry_id: FileEntryId,
 }
 
-impl PartialEq for FileEntryRef {
-    fn eq(&self, other: &Self) -> bool {
-        self.manager_id == other.manager_id && self.file_entry_id == other.file_entry_id
+impl FileEntryRef {
+    pub fn id(&self) -> FileEntryId {
+        self.file_entry_id
     }
-}
 
-impl Eq for FileEntryRef {}
+    pub fn name(&self) -> &Path {
+        &self.include_path
+    }
 
-impl Hash for FileEntryRef {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.manager_id.hash(state);
-        self.file_entry_id.hash(state);
+    pub fn dir(&self) -> Option<&Path> {
+        self.include_path.parent()
+    }
+
+    pub fn is_same_file(&self, other: &Self) -> bool {
+        self.manager_id == other.manager_id && self.file_entry_id == other.file_entry_id
     }
 }
 
@@ -66,23 +63,20 @@ impl FileManagerId {
 #[derive(Debug)]
 pub struct FileManager {
     id: FileManagerId,
-    files: Vec<FileEntry>,
     unique_files: HashMap<UniqueFileId, FileEntryId>,
     seen_files: HashMap<PathBuf, FileEntryId>,
+    next_file_entry_id: usize,
 }
 
 impl FileManager {
     pub fn new() -> Self {
         Self {
             id: FileManagerId::new(),
-            files: Vec::new(),
+            // files: Vec::new(),
             unique_files: HashMap::new(),
             seen_files: HashMap::new(),
+            next_file_entry_id: 0,
         }
-    }
-
-    pub fn get_file_entry(&self, file_entry_id: FileEntryId) -> Option<&FileEntry> {
-        self.files.get(file_entry_id.0)
     }
 
     pub fn get_file_ref(&mut self, file_path: &Path) -> Option<FileEntryRef> {
@@ -104,11 +98,8 @@ impl FileManager {
         let file_entry_id = if let Some(&file_entry_id) = self.unique_files.get(&unique_file_id) {
             file_entry_id
         } else {
-            let file_entry = FileEntry {
-                file_path: PathBuf::from(file_path),
-            };
-            self.files.push(file_entry);
-            let file_entry_id = FileEntryId(self.files.len() - 1);
+            let file_entry_id = FileEntryId(self.next_file_entry_id);
+            self.next_file_entry_id += 1;
             self.unique_files.insert(unique_file_id, file_entry_id);
             file_entry_id
         };
@@ -126,8 +117,7 @@ impl FileManager {
     pub fn get_buf_for_file(&self, file_entry_ref: &FileEntryRef) -> Option<Vec<u8>> {
         debug_assert_eq!(self.id, file_entry_ref.manager_id);
 
-        let file_entry = self.files.get(file_entry_ref.file_entry_id.0)?;
-        fs::read(&file_entry.file_path).ok()
+        fs::read(&file_entry_ref.include_path).ok()
     }
 }
 
@@ -254,7 +244,7 @@ pub struct SourceManager {
     contents: Vec<ContentCache>,
 
     /// The mapping from `FileEntryRef` to `ContentId`, which is used to retrieve the corresponding `ContentCache` from the `contents` vector.
-    file_infos: HashMap<FileEntryRef, ContentId>,
+    file_infos: HashMap<FileEntryId, ContentId>,
 
     /// The list of source location entries, which are used to map from `SourceLocation` to the corresponding file or macro expansion.
     sloc_entries: Vec<SLocEntry>,
@@ -287,8 +277,8 @@ impl SourceManager {
         file_manager: &FileManager,
         file_entry_ref: &FileEntryRef,
     ) -> Result<ContentId> {
-        // Since FileEntryRef's Eq/Hash are based on the underlying FileEntry, different paths to the same file share one ContentCache.
-        if let Some(&content_id) = self.file_infos.get(file_entry_ref) {
+        // Different paths to the same file share one ContentCache.
+        if let Some(&content_id) = self.file_infos.get(&file_entry_ref.id()) {
             return Ok(content_id);
         }
 
@@ -303,7 +293,7 @@ impl SourceManager {
         let content_cache = ContentCache::new(&buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
-        self.file_infos.insert(file_entry_ref.clone(), content_id);
+        self.file_infos.insert(file_entry_ref.id(), content_id);
 
         Ok(content_id)
     }
