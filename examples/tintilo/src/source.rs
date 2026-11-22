@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroU32;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -135,50 +136,38 @@ impl Default for FileManager {
     }
 }
 
-/// A cache for the contents of a file or memory buffer, which is lazily loaded when requested.
+/// A cache for the contents of a file or memory buffer.
 #[derive(Debug, Clone)]
 pub struct ContentCache {
-    /// The buffer containing the contents of the file or memory buffer. This is lazily loaded when requested by `get_buf()`.
-    buf: Option<Vec<u8>>,
-    contents_entry: Option<FileEntryRef>,
-    // line_offsets: Vec<u32>,
+    /// The buffer containing the contents of the file or memory buffer.
+    buf: Rc<[u8]>,
+    // line_offsets: OnceCell<Vec<u32>>,
 }
 
 impl ContentCache {
-    pub fn new(contents_entry: Option<FileEntryRef>) -> Self {
+    pub fn new() -> Self {
         Self {
-            buf: None,
-            contents_entry,
-            // line_offsets: Vec::new(),
+            buf: Rc::new([]),
+            // line_offsets: OnceCell::new(),
         }
     }
 
-    pub fn get_buf(&mut self, file_manager: &FileManager) -> Option<&[u8]> {
-        if self.buf.is_some() {
-            return self.buf.as_deref();
-        }
-
-        self.buf = file_manager.get_buf_for_file(self.contents_entry.as_ref()?);
-        self.buf.as_deref()
+    pub fn get_buf(&self) -> Rc<[u8]> {
+        Rc::clone(&self.buf)
     }
 
     pub fn set_buf(&mut self, buf: &[u8]) {
-        self.buf = Some(buf.to_vec());
+        self.buf = Rc::from(buf);
     }
 
-    pub fn get_size(&self, file_manager: &FileManager) -> u32 {
-        if let Some(buf) = &self.buf {
-            return buf.len() as u32;
-        }
+    pub fn get_size(&self) -> u32 {
+        self.buf.len() as u32
+    }
+}
 
-        if let Some(contents_entry) = &self.contents_entry {
-            file_manager
-                .get_file_entry(contents_entry.file_entry_id)
-                .unwrap()
-                .size
-        } else {
-            0
-        }
+impl Default for ContentCache {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -301,27 +290,44 @@ impl SourceManager {
         }
     }
 
-    pub fn get_or_create_content_cache(&mut self, file_entry_ref: &FileEntryRef) -> ContentId {
+    pub fn get_or_create_content_cache(
+        &mut self,
+        file_entry_ref: &FileEntryRef,
+    ) -> Result<ContentId> {
         // Since FileEntryRef's Eq/Hash are based on the underlying FileEntry, different paths to the same file share one ContentCache.
         if let Some(&content_id) = self.file_infos.get(file_entry_ref) {
-            return content_id;
+            return Ok(content_id);
         }
 
-        let content_cache = ContentCache::new(Some(file_entry_ref.clone()));
+        let buf = self
+            .file_manager
+            .get_buf_for_file(file_entry_ref)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Failed to read file: {:?}",
+                    file_entry_ref.include_path.display()
+                )
+            })?;
+        let mut content_cache = ContentCache::new();
+        content_cache.set_buf(&buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
         self.file_infos.insert(file_entry_ref.clone(), content_id);
 
-        content_id
+        Ok(content_id)
     }
 
-    pub fn create_content_cache_for_mem_buf(&mut self, buf: &[u8]) -> ContentId {
-        let content_cache = ContentCache::new(None);
+    pub fn create_content_cache_for_mem_buf(&mut self, buf: &[u8]) -> Result<ContentId> {
+        let mut content_cache = ContentCache::new();
+        content_cache.set_buf(buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
-        self.contents.last_mut().unwrap().set_buf(buf);
+        self.contents
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("Failed to get content cache"))?
+            .set_buf(buf);
 
-        content_id
+        Ok(content_id)
     }
 
     pub fn create_file_id_for_file(
@@ -329,7 +335,7 @@ impl SourceManager {
         source_file: &FileEntryRef,
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
-        let content_id = self.get_or_create_content_cache(source_file);
+        let content_id = self.get_or_create_content_cache(source_file)?;
         self.create_file_id_impl(
             content_id,
             source_file.include_path.display().to_string().as_str(),
@@ -342,7 +348,7 @@ impl SourceManager {
         file: &[u8],
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
-        let content_id = self.create_content_cache_for_mem_buf(file);
+        let content_id = self.create_content_cache_for_mem_buf(file)?;
         self.create_file_id_impl(content_id, "<memory buffer>", include_pos)
     }
 
@@ -353,7 +359,7 @@ impl SourceManager {
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
         let file_size_with_eof = self.contents[file.0]
-            .get_size(&self.file_manager)
+            .get_size()
             // +1 means the end of file marker.
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_name))?;
@@ -378,9 +384,9 @@ impl SourceManager {
         Ok(file_id)
     }
 
-    pub fn get_buf_data(&mut self, file_id: FileId) -> Option<&[u8]> {
+    pub fn get_buf_data(&self, file_id: FileId) -> Option<Rc<[u8]>> {
         if let SLocEntryKind::File { content, .. } = self.sloc_entries.get(file_id.index())?.kind {
-            self.contents[content.0].get_buf(&self.file_manager)
+            Some(self.contents[content.0].get_buf())
         } else {
             None
         }
