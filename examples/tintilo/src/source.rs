@@ -251,9 +251,6 @@ pub enum SLocEntryKind {
 
 #[derive(Debug)]
 pub struct SourceManager {
-    // TODO: pass by reference?
-    file_manager: FileManager,
-
     /// The list of content caches for files and memory buffers.
     /// The ownership of the content caches is held by the `SourceManager`, and they are shared with `SLocEntry`s.
     ///
@@ -273,7 +270,6 @@ pub struct SourceManager {
 impl SourceManager {
     pub fn new() -> Self {
         Self {
-            file_manager: FileManager::new(),
             contents: Vec::new(),
             file_infos: HashMap::new(),
             sloc_entries: vec![
@@ -292,6 +288,7 @@ impl SourceManager {
 
     pub fn get_or_create_content_cache(
         &mut self,
+        file_manager: &FileManager,
         file_entry_ref: &FileEntryRef,
     ) -> Result<ContentId> {
         // Since FileEntryRef's Eq/Hash are based on the underlying FileEntry, different paths to the same file share one ContentCache.
@@ -299,8 +296,7 @@ impl SourceManager {
             return Ok(content_id);
         }
 
-        let buf = self
-            .file_manager
+        let buf = file_manager
             .get_buf_for_file(file_entry_ref)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -332,10 +328,11 @@ impl SourceManager {
 
     pub fn create_file_id_for_file(
         &mut self,
+        file_manager: &FileManager,
         source_file: &FileEntryRef,
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
-        let content_id = self.get_or_create_content_cache(source_file)?;
+        let content_id = self.get_or_create_content_cache(file_manager, source_file)?;
         self.create_file_id_impl(
             content_id,
             source_file.include_path.display().to_string().as_str(),
