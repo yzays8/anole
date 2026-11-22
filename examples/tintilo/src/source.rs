@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileEntryId(usize);
@@ -72,7 +72,6 @@ impl FileManager {
     pub fn new() -> Self {
         Self {
             id: FileManagerId::new(),
-            // files: Vec::new(),
             unique_files: HashMap::new(),
             seen_files: HashMap::new(),
             next_file_entry_id: 0,
@@ -114,10 +113,11 @@ impl FileManager {
         })
     }
 
-    pub fn get_buf_for_file(&self, file_entry_ref: &FileEntryRef) -> Option<Vec<u8>> {
+    pub fn get_buf_for_file(&self, file_entry_ref: &FileEntryRef) -> Result<Vec<u8>> {
         debug_assert_eq!(self.id, file_entry_ref.manager_id);
 
-        fs::read(&file_entry_ref.include_path).ok()
+        fs::read(&file_entry_ref.include_path)
+            .with_context(|| format!("cannot open {}", file_entry_ref.include_path.display()))
     }
 }
 
@@ -146,10 +146,6 @@ impl ContentCache {
 
     pub fn get_buf(&self) -> Rc<[u8]> {
         Rc::clone(&self.buf)
-    }
-
-    pub fn set_buf(&mut self, buf: &[u8]) {
-        self.buf = Rc::from(buf);
     }
 
     pub fn get_size(&self) -> u32 {
@@ -225,11 +221,15 @@ impl SLocEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContentId(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileRefId(usize);
+
 #[derive(Debug, Clone)]
 pub enum SLocEntryKind {
     File {
         include_loc: Option<SourceLocation>,
         content: ContentId,
+        file_ref: Option<FileRefId>,
     },
     // TODO
     Macro,
@@ -251,6 +251,8 @@ pub struct SourceManager {
     /// The starting offset of the next `SLocEntry`.
     /// This is in global offset space, which is the same as the offset of `SourceLocation`.
     next_offset: u32,
+
+    file_refs: Vec<FileEntryRef>,
 }
 
 impl SourceManager {
@@ -258,17 +260,19 @@ impl SourceManager {
         Self {
             contents: Vec::new(),
             file_infos: HashMap::new(),
-            sloc_entries: vec![
-                // dummy entry for invalid SourceLocation
-                SLocEntry {
-                    base_offset: 0,
-                    kind: SLocEntryKind::Macro,
-                },
-            ],
-            // 0 and 1 are reserved for invalid SourceLocation.
-            // The length of the dummy entry is 1, but end-of-file marker takes 1 more byte, so the next offset is 2.
-            // See create_file_id_impl().
-            next_offset: 2,
+            sloc_entries: vec![],
+            // 0 is invalid SourceLocation.
+            next_offset: 1,
+            file_refs: vec![],
+        }
+    }
+
+    pub fn get_file_entry_ref_for_id(&self, file_id: FileId) -> Option<&FileEntryRef> {
+        match self.sloc_entries.get(file_id.index())?.kind {
+            SLocEntryKind::File {
+                file_ref: Some(id), ..
+            } => self.file_refs.get(id.0),
+            _ => None,
         }
     }
 
@@ -282,14 +286,7 @@ impl SourceManager {
             return Ok(content_id);
         }
 
-        let buf = file_manager
-            .get_buf_for_file(file_entry_ref)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to read file: {}",
-                    file_entry_ref.include_path.display()
-                )
-            })?;
+        let buf = file_manager.get_buf_for_file(file_entry_ref)?;
         let content_cache = ContentCache::new(&buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
@@ -302,10 +299,6 @@ impl SourceManager {
         let content_cache = ContentCache::new(buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
-        self.contents
-            .last_mut()
-            .ok_or_else(|| anyhow::anyhow!("Failed to get content cache"))?
-            .set_buf(buf);
 
         Ok(content_id)
     }
@@ -317,11 +310,7 @@ impl SourceManager {
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
         let content_id = self.get_or_create_content_cache(file_manager, source_file)?;
-        self.create_file_id_impl(
-            content_id,
-            source_file.include_path.display().to_string().as_str(),
-            include_pos,
-        )
+        self.create_file_id_impl(content_id, Some(source_file), include_pos)
     }
 
     pub fn create_file_id_for_buf(
@@ -330,18 +319,24 @@ impl SourceManager {
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
         let content_id = self.create_content_cache_for_mem_buf(file)?;
-        self.create_file_id_impl(content_id, "<memory buffer>", include_pos)
+        self.create_file_id_impl(content_id, None, include_pos)
     }
 
     fn create_file_id_impl(
         &mut self,
         file: ContentId,
-        file_path: &str,
+        file_ref: Option<&FileEntryRef>,
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
+        let file_path = if let Some(file_ref) = file_ref {
+            file_ref.include_path.display().to_string()
+        } else {
+            "<memory buffer>".to_string()
+        };
+
         let file_size_with_eof = self.contents[file.0]
             .get_size()
-            // +1 means the end of file marker.
+            // +1 means EOF.
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_path))?;
 
@@ -352,11 +347,17 @@ impl SourceManager {
 
         let file_id = FileId::from_index(self.sloc_entries.len());
 
+        let file_ref_id = file_ref.map(|r| {
+            self.file_refs.push(r.clone());
+            FileRefId(self.file_refs.len() - 1)
+        });
+
         self.sloc_entries.push(SLocEntry {
             base_offset: self.next_offset,
             kind: SLocEntryKind::File {
                 include_loc: include_pos,
                 content: file,
+                file_ref: file_ref_id,
             },
         });
 
@@ -376,13 +377,13 @@ impl SourceManager {
     pub fn get_loc_for_start_of_file(&self, file_id: FileId) -> Option<SourceLocation> {
         self.sloc_entries
             .get(file_id.index())
-            // The first SLocEntry is a dummy entry for invalid SourceLocation, so we skip it.
-            .filter(|entry| entry.base_offset != 0)
+            .filter(|entry| entry.is_file())
             .map(|entry| SourceLocation::from_file_loc(entry.base_offset))
     }
 
     pub fn get_composed_loc(&self, file_id: FileId, offset: u32) -> Option<SourceLocation> {
-        debug_assert!(offset < self.get_file_id_size(file_id));
+        // NOTE: The EOF appears where offset == get_file_id_size(file_id).
+        debug_assert!(offset <= self.get_file_id_size(file_id)?);
 
         let entry = self.sloc_entries.get(file_id.index())?;
         let global_offset = entry.base_offset + offset;
@@ -411,17 +412,16 @@ impl SourceManager {
         }
     }
 
-    pub fn get_file_id_size(&self, file_id: FileId) -> u32 {
+    pub fn get_file_id_size(&self, file_id: FileId) -> Option<u32> {
         let next_offset = if file_id.index() + 1 == self.sloc_entries.len() {
             // If this is the last SLocEntry, the next offset is the next_offset of the SourceManager.
             self.next_offset
         } else {
             // Otherwise, the next offset is the base_offset of the next SLocEntry.
-            self.sloc_entries[file_id.index() + 1].base_offset
+            self.sloc_entries.get(file_id.index() + 1)?.base_offset
         };
-        // Ignore the end-of-file marker by subtracting 1 from the size.
-        // See create_file_id_impl().
-        next_offset - self.sloc_entries[file_id.index()].base_offset - 1
+        // Ignore the EOF by subtracting 1 from the size.
+        Some(next_offset - self.sloc_entries.get(file_id.index())?.base_offset - 1)
     }
 
     #[allow(unused_variables)]
