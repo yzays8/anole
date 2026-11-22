@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -16,7 +17,6 @@ pub struct FileEntryId(usize);
 #[derive(Debug)]
 pub struct FileEntry {
     pub file_path: PathBuf,
-    pub size: u32,
 }
 
 /// A reference to a file entry that can be used to retrieve the file entry from the `FileManager`.
@@ -106,7 +106,6 @@ impl FileManager {
         } else {
             let file_entry = FileEntry {
                 file_path: PathBuf::from(file_path),
-                size: u32::try_from(file_status.len()).unwrap(),
             };
             self.files.push(file_entry);
             let file_entry_id = FileEntryId(self.files.len() - 1);
@@ -125,6 +124,8 @@ impl FileManager {
     }
 
     pub fn get_buf_for_file(&self, file_entry_ref: &FileEntryRef) -> Option<Vec<u8>> {
+        debug_assert_eq!(self.id, file_entry_ref.manager_id);
+
         let file_entry = self.files.get(file_entry_ref.file_entry_id.0)?;
         fs::read(&file_entry.file_path).ok()
     }
@@ -141,14 +142,15 @@ impl Default for FileManager {
 pub struct ContentCache {
     /// The buffer containing the contents of the file or memory buffer.
     buf: Rc<[u8]>,
-    // line_offsets: OnceCell<Vec<u32>>,
+    #[allow(unused)]
+    line_offsets: OnceCell<Vec<u32>>,
 }
 
 impl ContentCache {
-    pub fn new() -> Self {
+    pub fn new(buf: &[u8]) -> Self {
         Self {
-            buf: Rc::new([]),
-            // line_offsets: OnceCell::new(),
+            buf: Rc::from(buf),
+            line_offsets: OnceCell::new(),
         }
     }
 
@@ -162,12 +164,6 @@ impl ContentCache {
 
     pub fn get_size(&self) -> u32 {
         self.buf.len() as u32
-    }
-}
-
-impl Default for ContentCache {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -300,12 +296,11 @@ impl SourceManager {
             .get_buf_for_file(file_entry_ref)
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Failed to read file: {:?}",
+                    "Failed to read file: {}",
                     file_entry_ref.include_path.display()
                 )
             })?;
-        let mut content_cache = ContentCache::new();
-        content_cache.set_buf(&buf);
+        let content_cache = ContentCache::new(&buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
         self.file_infos.insert(file_entry_ref.clone(), content_id);
@@ -314,8 +309,7 @@ impl SourceManager {
     }
 
     pub fn create_content_cache_for_mem_buf(&mut self, buf: &[u8]) -> Result<ContentId> {
-        let mut content_cache = ContentCache::new();
-        content_cache.set_buf(buf);
+        let content_cache = ContentCache::new(buf);
         self.contents.push(content_cache);
         let content_id = ContentId(self.contents.len() - 1);
         self.contents
@@ -352,19 +346,19 @@ impl SourceManager {
     fn create_file_id_impl(
         &mut self,
         file: ContentId,
-        file_name: &str,
+        file_path: &str,
         include_pos: Option<SourceLocation>,
     ) -> Result<FileId> {
         let file_size_with_eof = self.contents[file.0]
             .get_size()
             // +1 means the end of file marker.
             .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_name))?;
+            .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_path))?;
 
         let next_offset = self
             .next_offset
             .checked_add(file_size_with_eof)
-            .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_name))?;
+            .ok_or_else(|| anyhow::anyhow!("File size overflow for file: {}", file_path))?;
 
         let file_id = FileId::from_index(self.sloc_entries.len());
 
@@ -398,6 +392,8 @@ impl SourceManager {
     }
 
     pub fn get_composed_loc(&self, file_id: FileId, offset: u32) -> Option<SourceLocation> {
+        debug_assert!(offset < self.get_file_id_size(file_id));
+
         let entry = self.sloc_entries.get(file_id.index())?;
         let global_offset = entry.base_offset + offset;
         if entry.is_file() {
